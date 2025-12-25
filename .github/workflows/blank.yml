@@ -10,6 +10,12 @@ jobs:
   build_image:
     runs-on: ubuntu-22.04
     steps:
+      - name: Install pinned Docker
+        uses: docker/setup-docker-action@v4
+        with:
+          version: v27.4.0 
+
+    
       - uses: actions/checkout@v4
 
       - name: Create Buildx builder
