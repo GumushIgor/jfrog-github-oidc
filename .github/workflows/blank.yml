@@ -55,7 +55,7 @@ jobs:
         id: push_canonical
         run: |
           SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
-          TARGET_REPO="productdemo.jfrog.io/docker-local"
+          TARGET_REPO="productdemo.jfrog.io/docker-local/myimg"
           CANONICAL_TAG="$TARGET_REPO:v1.2.3-linux-amd64"
 
           echo "Pushing canonical tag: $CANONICAL_TAG"
