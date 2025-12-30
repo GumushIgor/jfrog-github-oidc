@@ -56,18 +56,45 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y mitmproxy
 
-      - name: Start mitmproxy capture
+      - name: Start mitmproxy capture + generate CA
         run: |
+          # Start mitmproxy once in the background (creates ~/.mitmproxy in many cases)
           nohup mitmproxy --mode regular \
             --listen-host 127.0.0.1 \
             --listen-port 8080 \
             --save-stream-file mitmproxy.flows > mitmproxy.log 2>&1 &
           sleep 2
+
+          # Force-create the CA store if it doesn't exist (works even if ~/.mitmproxy wasn't created)
+          mkdir -p ~/.mitmproxy
+          # Generate CA/certs by asking mitmproxy to export them (idempotent)
+          # (Some builds generate on first real TLS connect, so we create a cert store proactively)
+          mitmproxy --quit 2>/dev/null || true
+
+          echo "=== ~/.mitmproxy contents ==="
           ls -lah ~/.mitmproxy || true
 
       - name: Trust mitmproxy CA
         run: |
-          sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
+          set -e
+          # Common CA cert filenames across distros/versions:
+          # - mitmproxy-ca-cert.pem
+          # - mitmproxy-ca.pem
+          CA1="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+          CA2="$HOME/.mitmproxy/mitmproxy-ca.pem"
+
+          if [ -f "$CA1" ]; then
+            CA="$CA1"
+          elif [ -f "$CA2" ]; then
+            CA="$CA2"
+          else
+            echo "ERROR: mitmproxy CA not found in ~/.mitmproxy"
+            echo "Contents:"
+            ls -lah "$HOME/.mitmproxy" || true
+            exit 1
+          fi
+
+          sudo cp "$CA" /usr/local/share/ca-certificates/mitmproxy-ca.crt
           sudo update-ca-certificates
 
       - name: Configure Docker daemon to use proxy
