@@ -1,4 +1,4 @@
-name: Build and Push Image with proxy
+name: withproxy
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
       - name: Create Buildx builder
         run: docker buildx create --use
 
-      - name: Build Docker image using BuildKit and export tar
+      - name: Build Docker image and export tar
         run: |
           docker buildx build \
             --platform linux/amd64 \
@@ -30,7 +30,7 @@ jobs:
             -t myapp:latest \
             --output type=docker,dest=./image.tar .
 
-      - name: Upload image tar as artifact
+      - name: Upload image tar
         uses: actions/upload-artifact@v4
         with:
           name: built-image
@@ -40,64 +40,62 @@ jobs:
     runs-on: ubuntu-latest
     needs: build_image
     steps:
+
+      # Install Docker
       - name: Install pinned Docker
         uses: docker/setup-docker-action@v4
         with:
           version: v28.0.4
 
+      # Download image
       - name: Download built image tar
         uses: actions/download-artifact@v4
         with:
           name: built-image
           path: .
 
-      - name: Install mitmproxy
+      # Install mitmproxy + openssl
+      - name: Install mitmproxy + openssl
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y mitmproxy
+          sudo apt-get install -y mitmproxy openssl
 
-      - name: Start mitmproxy capture + generate CA
+      # Create a self-signed CA for mitmproxy
+      - name: Create MITM CA
         run: |
-          # Start mitmproxy once in the background (creates ~/.mitmproxy in many cases)
-          nohup mitmproxy --mode regular \
-            --listen-host 127.0.0.1 \
-            --listen-port 8080 \
-            --save-stream-file mitmproxy.flows > mitmproxy.log 2>&1 &
-          sleep 2
+          mkdir -p $HOME/mitm-ca
+          openssl genrsa -out $HOME/mitm-ca/ca.key 2048
+          openssl req -x509 -new -nodes -key $HOME/mitm-ca/ca.key \
+            -sha256 -days 3650 \
+            -subj "/C=US/ST=CI/L=CI/O=CI MITM/OU=CI/CN=ci-mitm-ca" \
+            -out $HOME/mitm-ca/ca.crt
+          ls -lah $HOME/mitm-ca
 
-          # Force-create the CA store if it doesn't exist (works even if ~/.mitmproxy wasn't created)
-          mkdir -p ~/.mitmproxy
-          # Generate CA/certs by asking mitmproxy to export them (idempotent)
-          # (Some builds generate on first real TLS connect, so we create a cert store proactively)
-          mitmproxy --quit 2>/dev/null || true
-
-          echo "=== ~/.mitmproxy contents ==="
-          ls -lah ~/.mitmproxy || true
-
-      - name: Trust mitmproxy CA
+      # Trust the CA
+      - name: Trust MITM CA system-wide
         run: |
-          set -e
-          # Common CA cert filenames across distros/versions:
-          # - mitmproxy-ca-cert.pem
-          # - mitmproxy-ca.pem
-          CA1="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-          CA2="$HOME/.mitmproxy/mitmproxy-ca.pem"
-
-          if [ -f "$CA1" ]; then
-            CA="$CA1"
-          elif [ -f "$CA2" ]; then
-            CA="$CA2"
-          else
-            echo "ERROR: mitmproxy CA not found in ~/.mitmproxy"
-            echo "Contents:"
-            ls -lah "$HOME/.mitmproxy" || true
-            exit 1
-          fi
-
-          sudo cp "$CA" /usr/local/share/ca-certificates/mitmproxy-ca.crt
+          sudo cp $HOME/mitm-ca/ca.crt /usr/local/share/ca-certificates/ci-mitm-ca.crt
           sudo update-ca-certificates
 
-      - name: Configure Docker daemon to use proxy
+      # Start mitmdump with our CA
+      - name: Start mitmproxy capture
+        run: |
+          mkdir -p $HOME/.mitmproxy
+          cp $HOME/mitm-ca/ca.crt     $HOME/.mitmproxy/mitmproxy-ca.pem
+          cp $HOME/mitm-ca/ca.key     $HOME/.mitmproxy/mitmproxy-ca-key.pem
+
+          nohup mitmdump --mode regular \
+            --listen-host 127.0.0.1 \
+            --listen-port 8080 \
+            --save-stream-file mitmproxy.flows \
+            > mitmproxy.log 2>&1 &
+
+          sleep 2
+          echo "MITM proxy is running"
+          ls -lah $HOME/.mitmproxy
+
+      # Configure Docker to use the proxy
+      - name: Configure Docker to use proxy
         run: |
           sudo mkdir -p /etc/systemd/system/docker.service.d
           cat <<'EOF' | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
@@ -110,41 +108,40 @@ jobs:
           sudo systemctl restart docker
           docker info
 
+      # Login to registry
       - name: Log in to JFrog Docker registry
         run: |
           docker login productdemo.jfrog.io \
             -u "${{ secrets.JFROG_USERNAME }}" \
             --password "${{ secrets.JFROG_PASSWORD }}"
 
+      # Load the image
       - name: Load Docker image from tar
         id: load_image
         run: |
           docker load --input image.tar
-          echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
+          echo "image_name=myapp:latest" >> $GITHUB_OUTPUT
 
-      - name: Tag & Push canonical tag (docker --debug)
+      # Push via proxy (with debug)
+      - name: Tag & Push via proxy
         id: push_canonical
-        env:
-          DOCKER_CLI_HINTS: "false"
         run: |
           SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
           TARGET_REPO="productdemo.jfrog.io/docker-local/myimg"
           CANONICAL_TAG="$TARGET_REPO:v1.2.3-linux-amd64"
-
-          echo "Pushing canonical tag: $CANONICAL_TAG"
           docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
-
           docker --debug push "$CANONICAL_TAG"
-
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
+      # Collect logs
       - name: Collect docker daemon logs
         if: always()
         run: |
           sudo journalctl -u docker --no-pager > dockerd.log || true
           ls -lah
 
+      # Upload artifacts
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
