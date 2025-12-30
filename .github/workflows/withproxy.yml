@@ -2,8 +2,7 @@ name: withproxy
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -40,108 +39,164 @@ jobs:
     runs-on: ubuntu-latest
     needs: build_image
     steps:
-
-      # Install Docker
       - name: Install pinned Docker
         uses: docker/setup-docker-action@v4
         with:
           version: v28.0.4
 
-      # Download image
       - name: Download built image tar
         uses: actions/download-artifact@v4
         with:
           name: built-image
           path: .
 
-      # Install mitmproxy + openssl
       - name: Install mitmproxy + openssl
         run: |
           sudo apt-get update -y
           sudo apt-get install -y mitmproxy openssl
 
-      # Create a self-signed CA for mitmproxy
-      - name: Create MITM CA
+      - name: Create MITM CA (mitmproxy-compatible)
         run: |
-          mkdir -p $HOME/mitm-ca
-          openssl genrsa -out $HOME/mitm-ca/ca.key 2048
-          openssl req -x509 -new -nodes -key $HOME/mitm-ca/ca.key \
-            -sha256 -days 3650 \
-            -subj "/C=US/ST=CI/L=CI/O=CI MITM/OU=CI/CN=ci-mitm-ca" \
-            -out $HOME/mitm-ca/ca.crt
-          ls -lah $HOME/mitm-ca
+          set -euo pipefail
 
-      # Trust the CA
+          export MITM_CONF="$HOME/mitm-conf"
+          mkdir -p "$MITM_CONF"
+
+          # Generate RSA key (PKCS#1), then convert to PKCS#8 PEM (unencrypted)
+          openssl genrsa -out "$MITM_CONF/mitmproxy-ca-key.pem" 2048
+          openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
+            -in "$MITM_CONF/mitmproxy-ca-key.pem" \
+            -out "$MITM_CONF/mitmproxy-ca-key.pkcs8.pem"
+          mv "$MITM_CONF/mitmproxy-ca-key.pkcs8.pem" "$MITM_CONF/mitmproxy-ca-key.pem"
+
+          # Self-signed CA cert (filename mitmproxy expects)
+          openssl req -x509 -new -nodes \
+            -key "$MITM_CONF/mitmproxy-ca-key.pem" \
+            -sha256 -days 3650 \
+            -subj "/C=US/ST=CI/L=CI/O=CI MITM/OU=mitmproxy/CN=ci-mitmproxy-ca" \
+            -out "$MITM_CONF/mitmproxy-ca.pem"
+
+          echo "=== Confdir contents ==="
+          ls -lah "$MITM_CONF"
+
       - name: Trust MITM CA system-wide
         run: |
-          sudo cp $HOME/mitm-ca/ca.crt /usr/local/share/ca-certificates/ci-mitm-ca.crt
+          set -euo pipefail
+          export MITM_CONF="$HOME/mitm-conf"
+
+          sudo cp "$MITM_CONF/mitmproxy-ca.pem" /usr/local/share/ca-certificates/ci-mitmproxy-ca.crt
           sudo update-ca-certificates
 
-      # Start mitmdump with our CA
-      - name: Start mitmproxy capture
+      - name: Create mitmproxy header logger addon
         run: |
-          mkdir -p $HOME/.mitmproxy
-          cp $HOME/mitm-ca/ca.crt     $HOME/.mitmproxy/mitmproxy-ca.pem
-          cp $HOME/mitm-ca/ca.key     $HOME/.mitmproxy/mitmproxy-ca-key.pem
+          cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
+          from datetime import datetime
 
-          nohup mitmdump --mode regular \
+          def request(flow):
+              ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+              req = flow.request
+
+              print(f"[{ts}] >>> {req.method} {req.scheme}://{req.host}{req.path}")
+
+              for k, v in req.headers.items():
+                  lk = k.lower()
+                  if lk in ("authorization", "proxy-authorization"):
+                      v = "<redacted>"
+                  print(f"  {k}: {v}")
+              print("")
+
+          def response(flow):
+              ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+              resp = flow.response
+              req = flow.request
+
+              print(f"[{ts}] <<< {resp.status_code} for {req.method} {req.path}")
+
+              # Print a useful subset of response headers (add more if you want)
+              for k in ("Content-Length", "Docker-Upload-UUID", "Location", "Range", "Docker-Content-Digest"):
+                  if k in resp.headers:
+                      print(f"  {k}: {resp.headers.get(k)}")
+              print("")
+          PY
+
+          echo "Addon created:"
+          ls -lah "$GITHUB_WORKSPACE/dump_headers.py"
+
+      - name: Start mitmproxy capture (headless + header logging)
+        run: |
+          set -euo pipefail
+          export MITM_CONF="$HOME/mitm-conf"
+
+          nohup mitmdump --set confdir="$MITM_CONF" \
+            --mode regular \
             --listen-host 127.0.0.1 \
             --listen-port 8080 \
-            --save-stream-file mitmproxy.flows \
-            > mitmproxy.log 2>&1 &
+            --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
+            -s "$GITHUB_WORKSPACE/dump_headers.py" \
+            > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
           sleep 2
-          echo "MITM proxy is running"
-          ls -lah $HOME/.mitmproxy
+          echo "=== mitmproxy.log (head) ==="
+          head -n 80 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
-      # Configure Docker to use the proxy
-      - name: Configure Docker to use proxy
+      - name: Configure Docker daemon to use proxy
         run: |
+          set -euo pipefail
+
           sudo mkdir -p /etc/systemd/system/docker.service.d
           cat <<'EOF' | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
           [Service]
           Environment="HTTP_PROXY=http://127.0.0.1:8080"
           Environment="HTTPS_PROXY=http://127.0.0.1:8080"
-          Environment="NO_PROXY=localhost,127.0.0.1,productdemo.jfrog.io"
+          Environment="NO_PROXY=localhost,127.0.0.1"
           EOF
+
           sudo systemctl daemon-reload
           sudo systemctl restart docker
+
+          echo "Docker service env:"
+          sudo systemctl show docker --property=Environment --no-pager || true
+
           docker info
 
-      # Login to registry
       - name: Log in to JFrog Docker registry
         run: |
           docker login productdemo.jfrog.io \
             -u "${{ secrets.JFROG_USERNAME }}" \
             --password "${{ secrets.JFROG_PASSWORD }}"
 
-      # Load the image
       - name: Load Docker image from tar
         id: load_image
         run: |
           docker load --input image.tar
-          echo "image_name=myapp:latest" >> $GITHUB_OUTPUT
+          echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
 
-      # Push via proxy (with debug)
-      - name: Tag & Push via proxy
+      - name: Tag & Push canonical tag (docker --debug)
         id: push_canonical
+        env:
+          DOCKER_CLI_HINTS: "false"
         run: |
+          set -euo pipefail
           SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
           TARGET_REPO="productdemo.jfrog.io/docker-local/myimg"
           CANONICAL_TAG="$TARGET_REPO:v1.2.3-linux-amd64"
-          docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
-          docker --debug push "$CANONICAL_TAG"
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
-      # Collect logs
-      - name: Collect docker daemon logs
+          echo "Pushing canonical tag: $CANONICAL_TAG"
+          docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
+
+          docker --debug push "$CANONICAL_TAG"
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Collect logs
         if: always()
         run: |
           sudo journalctl -u docker --no-pager > dockerd.log || true
+          echo "==== mitmproxy.log (tail) ===="
+          tail -n 200 "$GITHUB_WORKSPACE/mitmproxy.log" || true
           ls -lah
 
-      # Upload artifacts
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -151,3 +206,4 @@ jobs:
             mitmproxy.flows
             mitmproxy.log
             dockerd.log
+            dump_headers.py
