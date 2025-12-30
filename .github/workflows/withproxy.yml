@@ -10,13 +10,13 @@ jobs:
   build_image:
     runs-on: ubuntu-22.04
     steps:
-      # Install a specific Docker version (v28.0.4 here to match your test environment).
       - name: Install pinned Docker
         uses: docker/setup-docker-action@v4
         with:
           version: v28.0.4
 
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Create Buildx builder
         run: docker buildx create --use
@@ -40,44 +40,37 @@ jobs:
     runs-on: ubuntu-latest
     needs: build_image
     steps:
-      # Install the same Docker version for consistency
-      - name: Install pinned Docker
       - name: Install pinned Docker
         uses: docker/setup-docker-action@v4
         with:
           version: v28.0.4
 
-      - uses: actions/download-artifact@v4
+      - name: Download built image tar
+        uses: actions/download-artifact@v4
         with:
           name: built-image
           path: .
 
-      # Install mitmproxy to capture HTTP(S) traffic
       - name: Install mitmproxy
         run: |
           sudo apt-get update -y
           sudo apt-get install -y mitmproxy
 
-      # Start mitmproxy in the background and save flows to a file
       - name: Start mitmproxy capture
         run: |
           nohup mitmproxy --mode regular \
             --listen-host 127.0.0.1 \
             --listen-port 8080 \
             --save-stream-file mitmproxy.flows > mitmproxy.log 2>&1 &
-          # give mitmproxy a moment to start up
           sleep 2
+          ls -lah ~/.mitmproxy || true
 
-      # Trust the mitmproxy-generated CA so Docker can connect through it
       - name: Trust mitmproxy CA
         run: |
-          # mitmproxy generates its CA files in ~/.mitmproxy on first run
-          ls -lah ~/.mitmproxy || true
           sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt
           sudo update-ca-certificates
 
-      # Configure the Docker daemon to use the local proxy
-      - name: Configure Docker to use proxy
+      - name: Configure Docker daemon to use proxy
         run: |
           sudo mkdir -p /etc/systemd/system/docker.service.d
           cat <<'EOF' | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
@@ -88,6 +81,7 @@ jobs:
           EOF
           sudo systemctl daemon-reload
           sudo systemctl restart docker
+          docker info
 
       - name: Log in to JFrog Docker registry
         run: |
@@ -101,8 +95,7 @@ jobs:
           docker load --input image.tar
           echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
 
-      # Tag & push the image through the proxy, with Docker debug output enabled
-      - name: Tag & push canonical tag
+      - name: Tag & Push canonical tag (docker --debug)
         id: push_canonical
         env:
           DOCKER_CLI_HINTS: "false"
@@ -113,20 +106,16 @@ jobs:
 
           echo "Pushing canonical tag: $CANONICAL_TAG"
           docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
-          # --debug shows client-side details
+
           docker --debug push "$CANONICAL_TAG"
 
-          # Extract digest
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      # Collect logs from mitmproxy and docker daemon for inspection
-      - name: Collect logs
+      - name: Collect docker daemon logs
         if: always()
         run: |
-          # Docker daemon logs (journalctl)
           sudo journalctl -u docker --no-pager > dockerd.log || true
-          # Mitmproxy flows and log were already being saved
           ls -lah
 
       - name: Upload debug artifacts
