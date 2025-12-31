@@ -108,9 +108,7 @@ jobs:
             > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
           sleep 2
-          echo "=== mitmproxy started ==="
           ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
-          echo "=== confdir contents ==="
           ls -lah "$MITM_CONF" || true
 
       - name: Trust mitmproxy CA
@@ -130,18 +128,19 @@ jobs:
       - name: Sanity check - send traffic through proxy (curl)
         run: |
           set -euo pipefail
-          # This MUST appear in mitmproxy.log if the proxy is working at all.
           curl -I -x http://127.0.0.1:8080 https://example.com -m 10 || true
           sleep 1
-          echo "=== mitmproxy.log after curl (head) ==="
-          head -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          echo "=== mitmproxy.log after curl (tail) ==="
+          tail -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
-      - name: Configure Docker daemon proxy + enable daemon debug
+      # ✅ This is the key part: make SURE dockerd gets the proxy env and we verify it.
+      - name: Force Docker daemon to use proxy (and verify)
         run: |
           set -euo pipefail
 
-          # 1) systemd env for dockerd proxy
           sudo mkdir -p /etc/systemd/system/docker.service.d
+
+          # IMPORTANT: do NOT put the registry in NO_PROXY.
           cat <<'EOF' | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
           [Service]
           Environment="HTTP_PROXY=http://127.0.0.1:8080"
@@ -149,7 +148,7 @@ jobs:
           Environment="NO_PROXY=localhost,127.0.0.1"
           EOF
 
-          # 2) daemon debug (so dockerd.log contains proxy / registry details)
+          # Turn on daemon debug so dockerd.log is useful
           sudo mkdir -p /etc/docker
           cat <<'EOF' | sudo tee /etc/docker/daemon.json
           {
@@ -160,18 +159,15 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl restart docker
 
-          echo "=== docker service Environment ==="
+          echo "=== systemd docker env (must include HTTP_PROXY/HTTPS_PROXY) ==="
           sudo systemctl show docker --property=Environment --no-pager || true
 
-          echo "=== docker info ==="
+          # HARD FAIL if env isn't applied
+          sudo systemctl show docker --property=Environment --no-pager | grep -q "HTTP_PROXY=http://127.0.0.1:8080"
+
           docker info
 
       - name: Log in to JFrog Docker registry
-        env:
-          # Also set proxy in the client environment (covers any client-side HTTP stack)
-          HTTP_PROXY:  http://127.0.0.1:8080
-          HTTPS_PROXY: http://127.0.0.1:8080
-          NO_PROXY:    localhost,127.0.0.1
         run: |
           docker login productdemo.jfrog.io \
             -u "${{ secrets.JFROG_USERNAME }}" \
@@ -183,13 +179,10 @@ jobs:
           docker load --input image.tar
           echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
 
-      - name: Tag & Push canonical tag (force proxy env for the push step)
+      - name: Tag & Push canonical tag (docker --debug)
         id: push_canonical
         env:
           DOCKER_CLI_HINTS: "false"
-          HTTP_PROXY:  http://127.0.0.1:8080
-          HTTPS_PROXY: http://127.0.0.1:8080
-          NO_PROXY:    localhost,127.0.0.1
         run: |
           set -euo pipefail
           SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
@@ -198,23 +191,19 @@ jobs:
 
           docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
           docker --debug push "$CANONICAL_TAG"
+          sleep 2
 
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-
-          # Give mitmproxy a moment to flush
-          sleep 2
 
       - name: Collect logs
         if: always()
         run: |
           sudo journalctl -u docker --no-pager > dockerd.log || true
-          echo "==== mitmproxy.log (head) ===="
-          head -n 200 "$GITHUB_WORKSPACE/mitmproxy.log" || true
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 200 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
           echo "==== docker daemon log (tail) ===="
-          tail -n 200 "$GITHUB_WORKSPACE/dockerd.log" || true
+          tail -n 250 "$GITHUB_WORKSPACE/dockerd.log" || true
           ls -lah "$GITHUB_WORKSPACE" || true
 
       - name: Upload debug artifacts
