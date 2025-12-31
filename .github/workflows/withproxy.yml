@@ -1,54 +1,22 @@
-name: Build and Push Image (mitmproxy capture)
+name: Push via MITM (alpine)
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 jobs:
-  build_image:
+  push_alpine_via_mitm:
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Install pinned Docker (20.10.24)
+      - name: Install pinned Docker 20.10.24
         uses: docker/setup-docker-action@v4
         with:
-          version: "20.10.24"
+          version: v20.10.24
 
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Create Buildx builder
-        run: docker buildx create --use
-
-      - name: Build Docker image and export tar
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=false \
-            --sbom=false \
-            -t myapp:latest \
-            --output type=docker,dest=./image.tar .
-
-      - name: Upload image tar
-        uses: actions/upload-artifact@v4
-        with:
-          name: built-image
-          path: image.tar
-
-  push_image:
-    runs-on: ubuntu-22.04
-    needs: build_image
-    steps:
-      - name: Install pinned Docker (20.10.24)
-        uses: docker/setup-docker-action@v4
-        with:
-          version: "20.10.24"
-
-      - name: Download built image tar
-        uses: actions/download-artifact@v4
-        with:
-          name: built-image
-          path: .
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -64,23 +32,17 @@ jobs:
           pip install "mitmproxy==11.0.2"
           mitmdump --version
 
-      - name: Create mitmproxy addon (log headers + rewrite Location)
+      - name: Create mitmproxy header logger addon
         run: |
           cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
           from datetime import datetime
-
-          # We must rewrite Location so Docker follows the upload URL THROUGH the proxy,
-          # otherwise it will follow Location: https://productdemo.jfrog.io/... and bypass us.
-          UPSTREAM_HOST = "productdemo.jfrog.io"
-          LOCAL_HOSTPORT = "127.0.0.1:5000"
 
           REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
           def request(flow):
               ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
               r = flow.request
-              # pretty_url includes query string (important for ?digest=sha256:... commits)
-              print(f"[{ts}] >>> {r.method} {r.pretty_url}")
+              print(f"[{ts}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
               for k, v in r.headers.items():
                   if k.lower() in REDACT:
                       v = "<redacted>"
@@ -91,25 +53,23 @@ jobs:
               ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
               r = flow.request
               resp = flow.response
-
-              # Keep Docker pinned to our proxy by rewriting Location header
-              loc = resp.headers.get("Location")
-              if loc and UPSTREAM_HOST in loc:
-                  new_loc = loc.replace(UPSTREAM_HOST, LOCAL_HOSTPORT)
-                  resp.headers["Location"] = new_loc
-                  print(f"[{ts}] *** rewrote Location:")
-                  print(f"  from: {loc}")
-                  print(f"  to:   {new_loc}")
-                  print("")
-
               print(f"[{ts}] <<< {resp.status_code} for {r.method} {r.path}")
-              for k in ("Content-Length", "Docker-Upload-UUID", "Location", "Range", "Docker-Content-Digest"):
+              # Useful OCI/Docker headers to watch
+              keys = (
+                  "Content-Length",
+                  "Docker-Upload-UUID",
+                  "Location",
+                  "Range",
+                  "Docker-Content-Digest",
+                  "Etag",
+              )
+              for k in keys:
                   if k in resp.headers:
                       print(f"  {k}: {resp.headers.get(k)}")
               print("")
           PY
 
-      - name: Start mitmproxy reverse proxy (TLS MITM)
+      - name: Start mitmproxy reverse proxy (127.0.0.1:5000 -> https://productdemo.jfrog.io)
         run: |
           set -euo pipefail
           . .venv/bin/activate
@@ -117,12 +77,10 @@ jobs:
           export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
           mkdir -p "$MITM_CONF"
 
-          # Reverse proxy: local 127.0.0.1:5000 -> https://productdemo.jfrog.io
+          # Reverse mode: Docker talks to http://127.0.0.1:5000, mitm forwards to https://productdemo.jfrog.io
           nohup mitmdump \
             --set confdir="$MITM_CONF" \
-            --set stream_large_bodies=1 \
-            --set connection_strategy=lazy \
-            --mode "reverse:https://productdemo.jfrog.io" \
+            --mode reverse:https://productdemo.jfrog.io \
             --listen-host 127.0.0.1 \
             --listen-port 5000 \
             --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
@@ -131,75 +89,67 @@ jobs:
 
           sleep 2
           ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
-          ls -lah "$MITM_CONF" || true
+          echo "=== mitmproxy.log (head) ==="
+          head -n 40 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
-      - name: Trust mitmproxy CA
+      - name: Configure Docker to allow insecure registry for local MITM endpoint
         run: |
           set -euo pipefail
-          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
+          sudo mkdir -p /etc/docker
+          cat <<'EOF' | sudo tee /etc/docker/daemon.json
+          {
+            "debug": true,
+            "insecure-registries": ["127.0.0.1:5000"]
+          }
+          EOF
+          sudo systemctl restart docker
+          docker info | sed -n '1,120p'
 
-          if [ ! -f "$MITM_CONF/mitmproxy-ca-cert.pem" ]; then
-            echo "ERROR: CA cert not found in confdir."
-            ls -lah "$MITM_CONF" || true
-            exit 1
-          fi
-
-          sudo cp "$MITM_CONF/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/mitmproxy-ci-ca.crt
-          sudo update-ca-certificates
-
-      - name: Sanity check - curl through reverse proxy
+      - name: Login to Artifactory THROUGH the MITM endpoint
+        env:
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
         run: |
           set -euo pipefail
-          # This hits mitmproxy (127.0.0.1:5000) which forwards to productdemo.jfrog.io
-          curl -vkI https://127.0.0.1:5000/v2/ -m 10 || true
-          sleep 1
-          echo "=== mitmproxy.log after curl (tail) ==="
-          tail -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          # Login to the local endpoint; mitm forwards to productdemo.jfrog.io
+          echo "$JFROG_PASSWORD" | docker login 127.0.0.1:5000 -u "$JFROG_USERNAME" --password-stdin
 
-      - name: Load Docker image from tar
-        id: load_image
+      - name: Pull alpine from Docker Hub
         run: |
           set -euo pipefail
-          docker load --input image.tar
-          echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
+          docker pull alpine:3.19
+          docker images | head
 
-      # IMPORTANT: login must be against the proxy endpoint (127.0.0.1:5000),
-      # otherwise auth/token flows can bypass your proxy.
-      - name: Log in via proxy endpoint
+      - name: Tag alpine for Artifactory repo
         run: |
           set -euo pipefail
-          echo "${{ secrets.JFROG_PASSWORD }}" | docker login 127.0.0.1:5000 \
-            -u "${{ secrets.JFROG_USERNAME }}" \
-            --password-stdin
+          TARGET="127.0.0.1:5000/docker-local/myimg:alpine-3.19"
+          docker tag alpine:3.19 "$TARGET"
+          docker image inspect "$TARGET" --format='RepoDigests={{json .RepoDigests}} RootFS={{json .RootFS.Layers}}'
 
-      - name: Tag & Push via proxy endpoint (capture PATCH/PUT/HEAD)
+      - name: Push alpine via MITM (docker --debug)
         env:
           DOCKER_CLI_HINTS: "false"
         run: |
           set -euo pipefail
-          SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
-
-          # Push to local proxy hostname:port, but keep repository path the same.
-          TARGET_REPO="127.0.0.1:5000/docker-local/myimg"
-          CANONICAL_TAG="$TARGET_REPO:v1.2.3-linux-amd64"
-
-          docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
-          docker --debug push "$CANONICAL_TAG"
-
+          TARGET="127.0.0.1:5000/docker-local/myimg:alpine-3.19"
+          docker --debug push "$TARGET"
           sleep 2
-          echo "=== mitmproxy.log (tail) ==="
-          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
       - name: Collect logs
         if: always()
         run: |
           set -euo pipefail
-          sudo journalctl -u docker --no-pager > dockerd.log || true
+          sudo journalctl -u docker --no-pager > "$GITHUB_WORKSPACE/dockerd.log" || true
+
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 400 "$GITHUB_WORKSPACE/mitmproxy.log" || true
-          echo "==== dockerd.log (tail) ===="
+          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+
+          echo "==== docker daemon log (tail) ===="
           tail -n 250 "$GITHUB_WORKSPACE/dockerd.log" || true
-          ls -lah "$GITHUB_WORKSPACE" || true
+
+          echo "==== HEAD/PUT/PATCH requests seen (quick grep) ===="
+          grep -E ">>> (HEAD|PUT|PATCH) " -n "$GITHUB_WORKSPACE/mitmproxy.log" | tail -n 200 || true
 
       - name: Upload debug artifacts
         if: always()
