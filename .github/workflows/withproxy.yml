@@ -1,22 +1,22 @@
-name: Push via MITM (alpine)
+name: Build and Push Image (alpine via mitmproxy)
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  push_alpine_via_mitm:
+  push_via_mitmproxy:
     runs-on: ubuntu-22.04
-
     steps:
-      - name: Install pinned Docker 20.10.24
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # We intentionally use older Docker
+      - name: Install pinned Docker (20.10.24)
         uses: docker/setup-docker-action@v4
         with:
           version: v20.10.24
-
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,17 +32,19 @@ jobs:
           pip install "mitmproxy==11.0.2"
           mitmdump --version
 
-      - name: Create mitmproxy header logger addon
+      - name: Create mitmproxy addon (log request/response headers)
         run: |
           cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
           from datetime import datetime
 
           REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
+          def _ts():
+              return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
           def request(flow):
-              ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
               r = flow.request
-              print(f"[{ts}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
+              print(f"[{_ts()}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
               for k, v in r.headers.items():
                   if k.lower() in REDACT:
                       v = "<redacted>"
@@ -50,26 +52,27 @@ jobs:
               print("")
 
           def response(flow):
-              ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
               r = flow.request
               resp = flow.response
-              print(f"[{ts}] <<< {resp.status_code} for {r.method} {r.path}")
-              # Useful OCI/Docker headers to watch
-              keys = (
+              print(f"[{_ts()}] <<< {resp.status_code} for {r.method} {r.path}")
+              # Print a few useful headers (add more if you want)
+              for k in (
+                  "Content-Type",
                   "Content-Length",
                   "Docker-Upload-UUID",
+                  "Docker-Content-Digest",
                   "Location",
                   "Range",
-                  "Docker-Content-Digest",
-                  "Etag",
-              )
-              for k in keys:
+                  "WWW-Authenticate",
+              ):
                   if k in resp.headers:
                       print(f"  {k}: {resp.headers.get(k)}")
               print("")
           PY
 
-      - name: Start mitmproxy reverse proxy (127.0.0.1:5000 -> https://productdemo.jfrog.io)
+      # Start mitmproxy as a *reverse proxy* that listens on 127.0.0.1:5000
+      # and forwards to https://productdemo.jfrog.io
+      - name: Start mitmproxy reverse proxy (127.0.0.1:5000 -> productdemo.jfrog.io:443)
         run: |
           set -euo pipefail
           . .venv/bin/activate
@@ -77,10 +80,13 @@ jobs:
           export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
           mkdir -p "$MITM_CONF"
 
-          # Reverse mode: Docker talks to http://127.0.0.1:5000, mitm forwards to https://productdemo.jfrog.io
+          # IMPORTANT:
+          # - reverse:https://productdemo.jfrog.io makes mitmproxy terminate TLS upstream to Artifactory.
+          # - Docker talks to http://127.0.0.1:5000 (plain HTTP), so we avoid TLS issues on the client side.
+          # - We do NOT want Docker to bypass proxy, so NO_PROXY must NOT include 127.0.0.1 here for the daemon env.
           nohup mitmdump \
             --set confdir="$MITM_CONF" \
-            --mode reverse:https://productdemo.jfrog.io \
+            --mode "reverse:https://productdemo.jfrog.io" \
             --listen-host 127.0.0.1 \
             --listen-port 5000 \
             --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
@@ -90,66 +96,68 @@ jobs:
           sleep 2
           ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
           echo "=== mitmproxy.log (head) ==="
-          head -n 40 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          head -n 50 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
-      - name: Configure Docker to allow insecure registry for local MITM endpoint
+      # Make sure *dockerd* is NOT using a different proxy that could bypass your local reverse proxy.
+      # (We keep it simple: no proxy env for daemon at all.)
+      - name: Ensure Docker daemon has no proxy env (avoid bypass)
         run: |
           set -euo pipefail
-          sudo mkdir -p /etc/docker
-          cat <<'EOF' | sudo tee /etc/docker/daemon.json
-          {
-            "debug": true,
-            "insecure-registries": ["127.0.0.1:5000"]
-          }
-          EOF
+          sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
+          sudo systemctl daemon-reload
           sudo systemctl restart docker
-          docker info | sed -n '1,120p'
 
-      - name: Login to Artifactory THROUGH the MITM endpoint
-        env:
-          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Login to the local endpoint; mitm forwards to productdemo.jfrog.io
-          echo "$JFROG_PASSWORD" | docker login 127.0.0.1:5000 -u "$JFROG_USERNAME" --password-stdin
+          echo "=== systemd docker env (should NOT include HTTP_PROXY/HTTPS_PROXY) ==="
+          sudo systemctl show docker --property=Environment --no-pager || true
 
       - name: Pull alpine from Docker Hub
         run: |
           set -euo pipefail
-          docker pull alpine:3.19
+          docker pull alpine:latest
           docker images | head
 
-      - name: Tag alpine for Artifactory repo
+      # IMPORTANT:
+      # Push target is 127.0.0.1:5000 -> mitmproxy -> productdemo.jfrog.io
+      - name: Tag alpine for push target
         run: |
           set -euo pipefail
-          TARGET="127.0.0.1:5000/docker-local/myimg:alpine-3.19"
-          docker tag alpine:3.19 "$TARGET"
-          docker image inspect "$TARGET" --format='RepoDigests={{json .RepoDigests}} RootFS={{json .RootFS.Layers}}'
+          docker tag alpine:latest 127.0.0.1:5000/docker-local/myimg:alpine
 
-      - name: Push alpine via MITM (docker --debug)
+      # KEY FIX:
+      # Docker decides which creds to use by the *registry host* in the image name.
+      # Since we push to 127.0.0.1:5000, we MUST login to 127.0.0.1:5000 as well.
+      - name: Docker login (productdemo.jfrog.io)
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login productdemo.jfrog.io \
+            -u "${{ secrets.JFROG_USERNAME }}" \
+            --password-stdin
+
+      - name: Docker login (proxy registry 127.0.0.1:5000)  # required!
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login 127.0.0.1:5000 \
+            -u "${{ secrets.JFROG_USERNAME }}" \
+            --password-stdin
+
+      - name: Push via mitmproxy (docker --debug)
         env:
           DOCKER_CLI_HINTS: "false"
         run: |
           set -euo pipefail
-          TARGET="127.0.0.1:5000/docker-local/myimg:alpine-3.19"
-          docker --debug push "$TARGET"
-          sleep 2
+          docker --debug push 127.0.0.1:5000/docker-local/myimg:alpine
 
       - name: Collect logs
         if: always()
         run: |
-          set -euo pipefail
-          sudo journalctl -u docker --no-pager > "$GITHUB_WORKSPACE/dockerd.log" || true
-
+          set +e
+          sudo journalctl -u docker --no-pager > dockerd.log || true
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
-
+          tail -n 400 "$GITHUB_WORKSPACE/mitmproxy.log" || true
           echo "==== docker daemon log (tail) ===="
-          tail -n 250 "$GITHUB_WORKSPACE/dockerd.log" || true
-
-          echo "==== HEAD/PUT/PATCH requests seen (quick grep) ===="
-          grep -E ">>> (HEAD|PUT|PATCH) " -n "$GITHUB_WORKSPACE/mitmproxy.log" | tail -n 200 || true
+          tail -n 300 "$GITHUB_WORKSPACE/dockerd.log" || true
+          echo "==== files ===="
+          ls -lah "$GITHUB_WORKSPACE" || true
 
       - name: Upload debug artifacts
         if: always()
