@@ -1,4 +1,4 @@
-name: Build and Push Image
+name: Build and Push Image (Docker 20.10.24, local HTTP reverse-proxy -> Artifactory HTTPS)
 
 on:
   push:
@@ -9,19 +9,20 @@ jobs:
   build_image:
     runs-on: ubuntu-22.04
     steps:
-      - name: Install pinned Docker
+      - name: Install pinned Docker (20.10.24)
         uses: docker/setup-docker-action@v4
         with:
-          version: v28.0.4
+          version: v20.10.24
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create Buildx builder
-        run: docker buildx create --use
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image and export tar
         run: |
+          set -euo pipefail
           docker buildx build \
             --platform linux/amd64 \
             --provenance=false \
@@ -36,13 +37,13 @@ jobs:
           path: image.tar
 
   push_image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: build_image
     steps:
-      - name: Install pinned Docker
+      - name: Install pinned Docker (20.10.24)
         uses: docker/setup-docker-action@v4
         with:
-          version: v28.0.4
+          version: v20.10.24
 
       - name: Download built image tar
         uses: actions/download-artifact@v4
@@ -64,13 +65,18 @@ jobs:
           pip install "mitmproxy==11.0.2"
           mitmdump --version
 
-      - name: Create mitmproxy header logger addon
+      - name: Create mitmproxy reverse-proxy header logger addon
         run: |
           cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
           from datetime import datetime
+
+          UPSTREAM_HOST = "productdemo.jfrog.io"
           REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
           def request(flow):
+              # ensure upstream gets correct Host
+              flow.request.headers["host"] = UPSTREAM_HOST
+
               ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
               r = flow.request
               print(f"[{ts}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
@@ -91,119 +97,83 @@ jobs:
               print("")
           PY
 
-      - name: Start mitmproxy capture
+      - name: Start mitmproxy in REVERSE mode (HTTP listener -> Artifactory HTTPS)
         run: |
           set -euo pipefail
           . .venv/bin/activate
 
-          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
-          mkdir -p "$MITM_CONF"
-
-          nohup mitmdump --set confdir="$MITM_CONF" \
-            --mode regular \
+          nohup mitmdump \
+            --mode "reverse:https://productdemo.jfrog.io" \
             --listen-host 127.0.0.1 \
-            --listen-port 8080 \
+            --listen-port 5000 \
             --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
             -s "$GITHUB_WORKSPACE/dump_headers.py" \
             > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
           sleep 2
           ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
-          ls -lah "$MITM_CONF" || true
+          tail -n 40 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
-      - name: Trust mitmproxy CA
+      - name: Configure Docker to allow local HTTP registry (insecure-registries)
         run: |
           set -euo pipefail
-          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
-
-          if [ ! -f "$MITM_CONF/mitmproxy-ca-cert.pem" ]; then
-            echo "ERROR: CA cert not found in confdir."
-            ls -lah "$MITM_CONF" || true
-            exit 1
-          fi
-
-          sudo cp "$MITM_CONF/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/mitmproxy-ci-ca.crt
-          sudo update-ca-certificates
-
-      - name: Sanity check - send traffic through proxy (curl)
-        run: |
-          set -euo pipefail
-          curl -I -x http://127.0.0.1:8080 https://example.com -m 10 || true
-          sleep 1
-          echo "=== mitmproxy.log after curl (tail) ==="
-          tail -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
-
-      # ✅ This is the key part: make SURE dockerd gets the proxy env and we verify it.
-      - name: Force Docker daemon to use proxy (and verify)
-        run: |
-          set -euo pipefail
-
-          sudo mkdir -p /etc/systemd/system/docker.service.d
-
-          # IMPORTANT: do NOT put the registry in NO_PROXY.
-          cat <<'EOF' | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
-          [Service]
-          Environment="HTTP_PROXY=http://127.0.0.1:8080"
-          Environment="HTTPS_PROXY=http://127.0.0.1:8080"
-          Environment="NO_PROXY=localhost,127.0.0.1"
-          EOF
-
-          # Turn on daemon debug so dockerd.log is useful
           sudo mkdir -p /etc/docker
+
           cat <<'EOF' | sudo tee /etc/docker/daemon.json
           {
-            "debug": true
+            "debug": true,
+            "insecure-registries": ["127.0.0.1:5000"]
           }
           EOF
 
           sudo systemctl daemon-reload
           sudo systemctl restart docker
 
-          echo "=== systemd docker env (must include HTTP_PROXY/HTTPS_PROXY) ==="
-          sudo systemctl show docker --property=Environment --no-pager || true
-
-          # HARD FAIL if env isn't applied
-          sudo systemctl show docker --property=Environment --no-pager | grep -q "HTTP_PROXY=http://127.0.0.1:8080"
-
-          docker info
-
-      - name: Log in to JFrog Docker registry
-        run: |
-          docker login productdemo.jfrog.io \
-            -u "${{ secrets.JFROG_USERNAME }}" \
-            --password "${{ secrets.JFROG_PASSWORD }}"
+          docker version
+          docker info | sed -n '1,180p'
 
       - name: Load Docker image from tar
         id: load_image
         run: |
+          set -euo pipefail
           docker load --input image.tar
           echo "image_name=myapp:latest" >> "$GITHUB_OUTPUT"
 
-      - name: Tag & Push canonical tag (docker --debug)
-        id: push_canonical
+      - name: Login to LOCAL proxy endpoint (credentials forwarded to Artifactory)
+        run: |
+          set -euo pipefail
+          docker login 127.0.0.1:5000 \
+            -u "${{ secrets.JFROG_USERNAME }}" \
+            --password "${{ secrets.JFROG_PASSWORD }}"
+
+      - name: Tag & Push via local proxy (docker --debug)
         env:
           DOCKER_CLI_HINTS: "false"
         run: |
           set -euo pipefail
+
           SOURCE_IMAGE="${{ steps.load_image.outputs.image_name }}"
-          TARGET_REPO="productdemo.jfrog.io/docker-local/myimg"
-          CANONICAL_TAG="$TARGET_REPO:v1.2.3-linux-amd64"
+
+          # Docker pushes to local HTTP registry endpoint,
+          # mitmproxy forwards to https://productdemo.jfrog.io/<same path>
+          TARGET_REPO="127.0.0.1:5000/docker-local/myimg"
+          TAG="v1.2.3-linux-amd64"
+          CANONICAL_TAG="$TARGET_REPO:$TAG"
 
           docker tag "$SOURCE_IMAGE" "$CANONICAL_TAG"
           docker --debug push "$CANONICAL_TAG"
-          sleep 2
 
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CANONICAL_TAG" | cut -d'@' -f2)
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          sleep 2
+          echo "Pushed via local proxy: $CANONICAL_TAG"
 
       - name: Collect logs
         if: always()
         run: |
           sudo journalctl -u docker --no-pager > dockerd.log || true
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
-          echo "==== docker daemon log (tail) ===="
-          tail -n 250 "$GITHUB_WORKSPACE/dockerd.log" || true
+          tail -n 350 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          echo "==== dockerd.log (tail) ===="
+          tail -n 350 "$GITHUB_WORKSPACE/dockerd.log" || true
           ls -lah "$GITHUB_WORKSPACE" || true
 
       - name: Upload debug artifacts
@@ -216,4 +186,3 @@ jobs:
             mitmproxy.log
             dockerd.log
             dump_headers.py
-            mitm-conf
