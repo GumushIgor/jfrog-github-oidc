@@ -1,4 +1,4 @@
-name: Build and Push Image (via mitmproxy reverse)
+name: Build and Push Image (reverse mitmproxy + Location rewrite)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       docker_version:
-        description: "Docker CLI/Engine version (pinned list)"
+        description: "Docker CLI/Engine version"
         type: choice
         required: true
         default: "20.10.24"
@@ -20,22 +20,22 @@ on:
         description: "Image to pull (e.g., alpine:latest, busybox:1.36)"
         type: string
         required: true
-        default: "alpine:latest"
+        default: "busybox:latest"
 
       push_image_path:
-        description: "Path to push in Artifactory WITHOUT registry host (e.g., docker-local/myimg)"
+        description: "Target path in Artifactory WITHOUT registry host (e.g., docker-local/myimg)"
         type: string
         required: true
-        default: "docker-local/myimg"
+        default: "docker-local/igorbusybox"
 
       push_tag:
-        description: "Tag to push (e.g., alpine, test123)"
+        description: "Target tag"
         type: string
         required: true
         default: "alpine"
 
       artifactory_host:
-        description: "Artifactory registry host (no scheme)"
+        description: "Upstream Artifactory host (no scheme)"
         type: string
         required: true
         default: "productdemo.jfrog.io"
@@ -77,37 +77,31 @@ jobs:
           docker version
           docker info | sed -n '1,80p'
 
-      - name: Validate inputs + derive refs
+      - name: Derive refs
         id: vars
         run: |
           set -euo pipefail
-
-          # Basic sanity (avoid accidental leading/trailing slashes/spaces)
           SRC="${{ inputs.source_image }}"
           PATH_ONLY="${{ inputs.push_image_path }}"
           TAG="${{ inputs.push_tag }}"
-          AF_HOST="${{ inputs.artifactory_host }}"
+
           LHOST="${{ inputs.proxy_listen_host }}"
           LPORT="${{ inputs.proxy_listen_port }}"
-
-          [[ -n "$SRC" ]] || { echo "source_image is empty"; exit 1; }
-          [[ -n "$PATH_ONLY" ]] || { echo "push_image_path is empty"; exit 1; }
-          [[ -n "$TAG" ]] || { echo "push_tag is empty"; exit 1; }
-
-          # Compose the "proxy registry" reference used by docker commands
           PROXY_REG="${LHOST}:${LPORT}"
+
           PUSH_REF="${PROXY_REG}/${PATH_ONLY}:${TAG}"
 
           echo "source_image=$SRC" >> "$GITHUB_OUTPUT"
           echo "proxy_registry=$PROXY_REG" >> "$GITHUB_OUTPUT"
           echo "push_ref=$PUSH_REF" >> "$GITHUB_OUTPUT"
-          echo "artifactory_host=$AF_HOST" >> "$GITHUB_OUTPUT"
+          echo "upstream_host=${{ inputs.artifactory_host }}" >> "$GITHUB_OUTPUT"
 
           echo "=== Selected ==="
           echo "Docker version : ${{ inputs.docker_version }}"
           echo "Source image   : $SRC"
           echo "Push ref       : $PUSH_REF"
-          echo "Upstream AF    : $AF_HOST"
+          echo "Upstream AF    : ${{ inputs.artifactory_host }}"
+          echo "Proxy listen   : http://${PROXY_REG}"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -123,40 +117,77 @@ jobs:
           pip install "mitmproxy==11.0.2"
           mitmdump --version
 
-      - name: Create mitmproxy addon (log request/response headers)
+      - name: Create mitmproxy addon (log + rewrite Location/realm)
         run: |
-          cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
+          cat > "$GITHUB_WORKSPACE/mitm_rewrite.py" <<'PY'
           from datetime import datetime
+          import os
 
           REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
+
+          PROXY_HOST = os.environ.get("MITM_PROXY_HOST", "127.0.0.1")
+          PROXY_PORT = os.environ.get("MITM_PROXY_PORT", "5000")
+          UPSTREAM_HOST = os.environ.get("MITM_UPSTREAM_HOST", "productdemo.jfrog.io")
+
+          PROXY_ORIGIN = f"http://{PROXY_HOST}:{PROXY_PORT}"
+          UPSTREAM_HTTPS = f"https://{UPSTREAM_HOST}"
+          UPSTREAM_HTTP = f"http://{UPSTREAM_HOST}"
 
           def _ts():
               return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-          def request(flow):
-              r = flow.request
-              print(f"[{_ts()}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
-              for k, v in r.headers.items():
+          def _print_headers(headers):
+              for k, v in headers.items():
                   if k.lower() in REDACT:
                       v = "<redacted>"
                   print(f"  {k}: {v}")
+
+          def request(flow):
+              r = flow.request
+              print(f"[{_ts()}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
+              _print_headers(r.headers)
               print("")
+
+          def _rewrite_abs_url(v: str) -> str:
+              # Keep docker pinned to proxy registry identity
+              if v.startswith(UPSTREAM_HTTPS):
+                  return PROXY_ORIGIN + v[len(UPSTREAM_HTTPS):]
+              if v.startswith(UPSTREAM_HTTP):
+                  return PROXY_ORIGIN + v[len(UPSTREAM_HTTP):]
+              return v
 
           def response(flow):
               r = flow.request
               resp = flow.response
+
+              # 1) Rewrite Location (upload continuation & other absolute redirects)
+              if "Location" in resp.headers:
+                  old = resp.headers["Location"]
+                  new = _rewrite_abs_url(old)
+                  if new != old:
+                      resp.headers["Location"] = new
+                      print(f"[{_ts()}] !!! Rewrote Location")
+                      print(f"  from: {old}")
+                      print(f"  to:   {new}")
+                      print("")
+
+              # 2) Rewrite WWW-Authenticate realm so token fetch stays via proxy
+              if "WWW-Authenticate" in resp.headers:
+                  old = resp.headers["WWW-Authenticate"]
+                  new = old.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
+                  new = new.replace(f'realm="{UPSTREAM_HTTP}', f'realm="{PROXY_ORIGIN}')
+                  if new != old:
+                      resp.headers["WWW-Authenticate"] = new
+                      print(f"[{_ts()}] !!! Rewrote WWW-Authenticate realm")
+                      print("")
+
               print(f"[{_ts()}] <<< {resp.status_code} for {r.method} {r.path}")
-              for k in (
-                  "Content-Type",
-                  "Content-Length",
-                  "Docker-Upload-UUID",
-                  "Docker-Content-Digest",
-                  "Location",
-                  "Range",
-                  "WWW-Authenticate",
-              ):
+              for k in ("Content-Type","Content-Length","Docker-Upload-UUID","Docker-Content-Digest","Location","Range","WWW-Authenticate"):
                   if k in resp.headers:
-                      print(f"  {k}: {resp.headers.get(k)}")
+                      v = resp.headers.get(k)
+                      if k.lower() in REDACT:
+                          v = "<redacted>"
+                      print(f"  {k}: {v}")
               print("")
           PY
 
@@ -168,23 +199,23 @@ jobs:
           export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
           mkdir -p "$MITM_CONF"
 
-          LHOST="${{ inputs.proxy_listen_host }}"
-          LPORT="${{ inputs.proxy_listen_port }}"
-          UP="${{ steps.vars.outputs.artifactory_host }}"
+          export MITM_PROXY_HOST="${{ inputs.proxy_listen_host }}"
+          export MITM_PROXY_PORT="${{ inputs.proxy_listen_port }}"
+          export MITM_UPSTREAM_HOST="${{ steps.vars.outputs.upstream_host }}"
 
           nohup mitmdump \
             --set confdir="$MITM_CONF" \
-            --mode "reverse:https://${UP}" \
-            --listen-host "${LHOST}" \
-            --listen-port "${LPORT}" \
+            --mode "reverse:https://${MITM_UPSTREAM_HOST}" \
+            --listen-host "${MITM_PROXY_HOST}" \
+            --listen-port "${MITM_PROXY_PORT}" \
             --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
-            -s "$GITHUB_WORKSPACE/dump_headers.py" \
+            -s "$GITHUB_WORKSPACE/mitm_rewrite.py" \
             > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
-          # small wait + basic health check (reverse proxy should answer something, usually 401 on /v2/)
-          for i in {1..20}; do
-            if curl -sS -o /dev/null "http://${LHOST}:${LPORT}/v2/" ; then
-              echo "mitmproxy is reachable at http://${LHOST}:${LPORT}"
+          # quick reachability check (expect 401/200 etc)
+          for i in {1..30}; do
+            if curl -sS -o /dev/null "http://${MITM_PROXY_HOST}:${MITM_PROXY_PORT}/v2/" ; then
+              echo "mitmproxy reachable at http://${MITM_PROXY_HOST}:${MITM_PROXY_PORT}"
               break
             fi
             sleep 0.5
@@ -201,7 +232,6 @@ jobs:
           sudo rm -f /etc/systemd/system/docker.service.d/https-proxy.conf || true
           sudo systemctl daemon-reload
           sudo systemctl restart docker
-          echo "=== systemd docker env (should NOT include HTTP_PROXY/HTTPS_PROXY) ==="
           sudo systemctl show docker --property=Environment --no-pager || true
 
       - name: Pull selected image
@@ -210,20 +240,19 @@ jobs:
           docker pull "${{ steps.vars.outputs.source_image }}"
           docker images | head
 
-      - name: Tag for push target (proxy registry)
+      - name: Tag for push (proxy registry)
         run: |
           set -euo pipefail
           docker tag "${{ steps.vars.outputs.source_image }}" "${{ steps.vars.outputs.push_ref }}"
           docker images | head
 
-      # Login to upstream host (optional but handy) AND to proxy registry (required for creds match)
-      - name: Docker login (upstream Artifactory host)
+      - name: Docker login (upstream host)
         run: |
           set -euo pipefail
-          echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.artifactory_host }}" \
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.upstream_host }}" \
             -u "${{ secrets.JFROG_USERNAME }}" --password-stdin
 
-      - name: Docker login (proxy registry host)  # required
+      - name: Docker login (proxy registry)  # required for host match
         run: |
           set -euo pipefail
           echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.proxy_registry }}" \
@@ -258,5 +287,5 @@ jobs:
             mitmproxy.log
             dockerd.log
             docker_cli_debug.log
-            dump_headers.py
+            mitm_rewrite.py
             mitm-conf
