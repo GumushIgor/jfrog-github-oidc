@@ -1,13 +1,54 @@
-name: Push via mitmproxy (relative Location fix)
+name: Build and Push Image (reverse mitmproxy + Location/realm/scope/service rewrite)
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      docker_version:
+        description: "Docker version"
+        type: choice
+        required: true
+        default: "20.10.24"
+        options: ["20.10.24", "24.0.9", "27.4.0", "28.0.4"]
+      source_image:
+        description: "Image to pull"
+        type: string
+        required: true
+        default: "busybox:latest"
+      push_image_path:
+        description: "Target path without registry host (e.g., docker-local/igorbusybox)"
+        type: string
+        required: true
+        default: "docker-local/igorbusybox"
+      push_tag:
+        description: "Target tag"
+        type: string
+        required: true
+        default: "alpine"
+      artifactory_host:
+        description: "Upstream host (no scheme)"
+        type: string
+        required: true
+        default: "productdemo.jfrog.io"
+      proxy_listen_host:
+        description: "mitm listen host"
+        type: string
+        required: true
+        default: "127.0.0.1"
+      proxy_listen_port:
+        description: "mitm listen port"
+        type: string
+        required: true
+        default: "5000"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   push_via_mitmproxy:
     runs-on: ubuntu-22.04
-    env:
-      DOCKER_CLI_HINTS: "false"
 
     steps:
       - uses: actions/checkout@v4
@@ -15,7 +56,19 @@ jobs:
       - name: Install Docker
         uses: docker/setup-docker-action@v4
         with:
-          version: "v20.10.24"
+          version: "v${{ inputs.docker_version }}"
+
+      - name: Derive refs
+        id: vars
+        run: |
+          set -euo pipefail
+          PROXY_REG="${{ inputs.proxy_listen_host }}:${{ inputs.proxy_listen_port }}"
+          PUSH_REF="${PROXY_REG}/${{ inputs.push_image_path }}:${{ inputs.push_tag }}"
+          echo "proxy_registry=$PROXY_REG" >> "$GITHUB_OUTPUT"
+          echo "push_ref=$PUSH_REF" >> "$GITHUB_OUTPUT"
+          echo "upstream_host=${{ inputs.artifactory_host }}" >> "$GITHUB_OUTPUT"
+          echo "source_image=${{ inputs.source_image }}" >> "$GITHUB_OUTPUT"
+          echo "Push ref: $PUSH_REF"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -24,12 +77,14 @@ jobs:
 
       - name: Install mitmproxy
         run: |
+          set -euo pipefail
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install "mitmproxy==11.0.2"
+          mitmdump --version
 
-      - name: Create mitm addon (rewrite WWW-Authenticate + Location->relative)
+      - name: Create mitmproxy addon (log + rewrite Location/realm/scope/service)
         run: |
           cat > "$GITHUB_WORKSPACE/mitm_rewrite.py" <<'PY'
           from datetime import datetime
@@ -48,7 +103,7 @@ jobs:
           UPSTREAM_HTTP  = f"http://{UPSTREAM_HOST}"
 
           def _ts():
-              return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+              return datetime.utcnow().isoformat(timespec="milliseconds")[:-3] + "Z"
 
           def _print_headers(headers):
               for k, v in headers.items():
@@ -62,17 +117,25 @@ jobs:
               _print_headers(r.headers)
               print("")
 
+          def _rewrite_abs_url(v: str) -> str:
+              # rewrite absolute upstream URLs back to proxy origin
+              if v.startswith(UPSTREAM_HTTPS):
+                  return PROXY_ORIGIN + v[len(UPSTREAM_HTTPS):]
+              if v.startswith(UPSTREAM_HTTP):
+                  return PROXY_ORIGIN + v[len(UPSTREAM_HTTP):]
+              return v
+
           def _rewrite_www_authenticate(flow, header_val: str) -> str:
               new = header_val
 
-              # realm -> proxy
+              # 1) realm -> proxy
               new = new.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
               new = new.replace(f'realm="{UPSTREAM_HTTP}',  f'realm="{PROXY_ORIGIN}')
 
-              # service -> proxy registry
+              # 2) service -> proxy registry
               new = re.sub(r'service="[^"]+"', f'service="{PROXY_REGISTRY}"', new)
 
-              # scope repository:<image>:... -> repository:<repo>/<image>:...
+              # 3) scope repository:<image>:... -> repository:<repo>/<image>:...
               m = re.match(r"^/v2/([^/]+)/([^/]+)/", flow.request.path)
               if m:
                   repo = m.group(1)
@@ -89,22 +152,29 @@ jobs:
               r = flow.request
               resp = flow.response
 
-              # IMPORTANT: rewrite Location to RELATIVE "/v2/..." so Docker keeps same auth context
+              # --- MINIMAL FIX ---
+              # For Docker upload flow, absolute Location with different host/scheme can cause Docker
+              # to drop Authorization on the follow-up PATCH. Rewrite Location to RELATIVE "/v2/..."
               if "Location" in resp.headers:
                   old = resp.headers["Location"]
+                  new = old
                   try:
                       p = urlparse(old)
+                      # If upstream returns absolute Location to /v2/..., return relative path only
                       if p.scheme and p.netloc and p.path.startswith("/v2/"):
-                          new = p.path
-                          if p.query:
-                              new += "?" + p.query
-                          resp.headers["Location"] = new
-                          print(f"[{_ts()}] !!! Rewrote Location to relative")
-                          print(f"  from: {old}")
-                          print(f"  to:   {new}")
-                          print("")
+                          new = p.path + (("?" + p.query) if p.query else "")
+                      else:
+                          # Keep your existing absolute rewrite as fallback
+                          new = _rewrite_abs_url(old)
                   except Exception:
-                      pass
+                      new = _rewrite_abs_url(old)
+
+                  if new != old:
+                      resp.headers["Location"] = new
+                      print(f"[{_ts()}] !!! Rewrote Location")
+                      print(f"  from: {old}")
+                      print(f"  to:   {new}")
+                      print("")
 
               if "WWW-Authenticate" in resp.headers:
                   old = resp.headers["WWW-Authenticate"]
@@ -123,46 +193,83 @@ jobs:
 
       - name: Start mitmproxy reverse proxy
         run: |
+          set -euo pipefail
           . .venv/bin/activate
+
           export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
           mkdir -p "$MITM_CONF"
 
-          export MITM_PROXY_HOST="127.0.0.1"
-          export MITM_PROXY_PORT="5000"
-          export MITM_UPSTREAM_HOST="productdemo.jfrog.io"
+          export MITM_PROXY_HOST="${{ inputs.proxy_listen_host }}"
+          export MITM_PROXY_PORT="${{ inputs.proxy_listen_port }}"
+          export MITM_UPSTREAM_HOST="${{ steps.vars.outputs.upstream_host }}"
 
           nohup mitmdump \
             --set confdir="$MITM_CONF" \
             --mode "reverse:https://${MITM_UPSTREAM_HOST}" \
             --listen-host "${MITM_PROXY_HOST}" \
             --listen-port "${MITM_PROXY_PORT}" \
+            --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
             -s "$GITHUB_WORKSPACE/mitm_rewrite.py" \
             > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
           sleep 2
           head -n 80 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
+      - name: Ensure Docker daemon has no proxy env
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
+          sudo rm -f /etc/systemd/system/docker.service.d/https-proxy.conf || true
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
+          sudo systemctl show docker --property=Environment --no-pager || true
+
+      - name: Pull selected image
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.vars.outputs.source_image }}"
+
+      - name: Tag for push (proxy registry)
+        run: |
+          set -euo pipefail
+          docker tag "${{ steps.vars.outputs.source_image }}" "${{ steps.vars.outputs.push_ref }}"
+
       - name: Docker login (upstream)
         run: |
-          echo "${{ secrets.JFROG_PASSWORD }}" | docker login productdemo.jfrog.io \
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.upstream_host }}" \
             -u "${{ secrets.JFROG_USERNAME }}" --password-stdin
 
       - name: Docker login (proxy registry)
         run: |
-          echo "${{ secrets.JFROG_PASSWORD }}" | docker login 127.0.0.1:5000 \
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.proxy_registry }}" \
             -u "${{ secrets.JFROG_USERNAME }}" --password-stdin
 
-      - name: Push (via proxy)
+      - name: Push via mitmproxy (docker --debug)
         run: |
           set -euo pipefail
-          docker pull busybox:latest
-          docker tag busybox:latest 127.0.0.1:5000/docker-local/igorbusybox:alpine
-          docker --debug push 127.0.0.1:5000/docker-local/igorbusybox:alpine 2>&1 | tee docker_cli_debug.log
+          docker --debug push "${{ steps.vars.outputs.push_ref }}" 2>&1 | tee docker_cli_debug.log
 
-      - name: Tail logs
+      - name: Collect logs
         if: always()
         run: |
+          set +e
+          sudo journalctl -u docker --no-pager > dockerd.log || true
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 250 "$GITHUB_WORKSPACE/mitmproxy.log" || true
-          echo "==== docker_cli_debug.log (tail) ===="
+          tail -n 300 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          echo "==== docker CLI debug (tail) ===="
           tail -n 200 "$GITHUB_WORKSPACE/docker_cli_debug.log" || true
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs
+          path: |
+            mitmproxy.flows
+            mitmproxy.log
+            dockerd.log
+            docker_cli_debug.log
+            mitm_rewrite.py
+            mitm-conf
