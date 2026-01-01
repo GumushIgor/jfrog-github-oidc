@@ -1,4 +1,4 @@
-name: Build and Push Image (reverse mitmproxy + Location rewrite)
+name: Build and Push Image (reverse mitmproxy + Location/scope rewrite)
 
 on:
   push:
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           docker version
-          docker info | sed -n '1,80p'
+          docker info | sed -n '1,120p'
 
       - name: Derive refs
         id: vars
@@ -117,11 +117,12 @@ jobs:
           pip install "mitmproxy==11.0.2"
           mitmdump --version
 
-      - name: Create mitmproxy addon (log + rewrite Location/realm)
+      - name: Create mitmproxy addon (log + rewrite Location + rewrite WWW-Authenticate realm/scope)
         run: |
           cat > "$GITHUB_WORKSPACE/mitm_rewrite.py" <<'PY'
           from datetime import datetime
           import os
+          import re
 
           REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
@@ -156,11 +157,41 @@ jobs:
                   return PROXY_ORIGIN + v[len(UPSTREAM_HTTP):]
               return v
 
+          def _rewrite_www_authenticate(flow, header_val: str) -> str:
+              """
+              Fix two common issues in reverse-proxy mode:
+              1) realm points to upstream -> rewrite to proxy origin
+              2) Artifactory sometimes returns scope repository:<image>:... while path is /v2/<repo>/<image>/...
+                 -> rewrite to repository:<repo>/<image>:...
+              """
+              new = header_val
+
+              # (1) rewrite realm to proxy
+              new = new.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
+              new = new.replace(f'realm="{UPSTREAM_HTTP}', f'realm="{PROXY_ORIGIN}')
+
+              # (2) rewrite scope using repo/image from request path
+              # Example: /v2/docker-local/igorbusybox/blobs/uploads/...
+              m = re.match(r"^/v2/([^/]+)/([^/]+)/", flow.request.path)
+              if m:
+                  repo = m.group(1)
+                  image = m.group(2)
+
+                  # If scope is repository:igorbusybox:pull,push -> repository:docker-local/igorbusybox:pull,push
+                  # (Only rewrite the exact image token, to avoid overmatching)
+                  new = re.sub(
+                      rf'scope="repository:{re.escape(image)}:',
+                      f'scope="repository:{repo}/{image}:',
+                      new
+                  )
+
+              return new
+
           def response(flow):
               r = flow.request
               resp = flow.response
 
-              # 1) Rewrite Location (upload continuation & other absolute redirects)
+              # Rewrite Location (upload continuation & redirects)
               if "Location" in resp.headers:
                   old = resp.headers["Location"]
                   new = _rewrite_abs_url(old)
@@ -171,14 +202,13 @@ jobs:
                       print(f"  to:   {new}")
                       print("")
 
-              # 2) Rewrite WWW-Authenticate realm so token fetch stays via proxy
+              # Rewrite WWW-Authenticate (realm and scope)
               if "WWW-Authenticate" in resp.headers:
                   old = resp.headers["WWW-Authenticate"]
-                  new = old.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
-                  new = new.replace(f'realm="{UPSTREAM_HTTP}', f'realm="{PROXY_ORIGIN}')
+                  new = _rewrite_www_authenticate(flow, old)
                   if new != old:
                       resp.headers["WWW-Authenticate"] = new
-                      print(f"[{_ts()}] !!! Rewrote WWW-Authenticate realm")
+                      print(f"[{_ts()}] !!! Rewrote WWW-Authenticate (realm/scope)")
                       print("")
 
               print(f"[{_ts()}] <<< {resp.status_code} for {r.method} {r.path}")
@@ -212,8 +242,8 @@ jobs:
             -s "$GITHUB_WORKSPACE/mitm_rewrite.py" \
             > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
 
-          # quick reachability check (expect 401/200 etc)
-          for i in {1..30}; do
+          # reachability check (expect 401/200)
+          for i in {1..40}; do
             if curl -sS -o /dev/null "http://${MITM_PROXY_HOST}:${MITM_PROXY_PORT}/v2/" ; then
               echo "mitmproxy reachable at http://${MITM_PROXY_HOST}:${MITM_PROXY_PORT}"
               break
@@ -223,7 +253,7 @@ jobs:
 
           ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
           echo "=== mitmproxy.log (head) ==="
-          head -n 80 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          head -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
       - name: Ensure Docker daemon has no proxy env (avoid bypass)
         run: |
@@ -232,6 +262,7 @@ jobs:
           sudo rm -f /etc/systemd/system/docker.service.d/https-proxy.conf || true
           sudo systemctl daemon-reload
           sudo systemctl restart docker
+          echo "=== systemd docker env (should NOT include HTTP_PROXY/HTTPS_PROXY) ==="
           sudo systemctl show docker --property=Environment --no-pager || true
 
       - name: Pull selected image
@@ -269,11 +300,11 @@ jobs:
           set +e
           sudo journalctl -u docker --no-pager > dockerd.log || true
           echo "==== mitmproxy.log (tail) ===="
-          tail -n 400 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          tail -n 500 "$GITHUB_WORKSPACE/mitmproxy.log" || true
           echo "==== docker daemon log (tail) ===="
           tail -n 300 "$GITHUB_WORKSPACE/dockerd.log" || true
           echo "==== docker CLI debug (tail) ===="
-          tail -n 200 "$GITHUB_WORKSPACE/docker_cli_debug.log" || true
+          tail -n 250 "$GITHUB_WORKSPACE/docker_cli_debug.log" || true
           echo "==== files ===="
           ls -lah "$GITHUB_WORKSPACE" || true
 
