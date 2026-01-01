@@ -1,4 +1,4 @@
-name: Push via local nginx proxy (token may bypass)
+name: Build and Push Image (alpine via mitmproxy)
 
 on:
   push:
@@ -6,185 +6,167 @@ on:
   workflow_dispatch:
 
 jobs:
-  push_via_proxy:
+  push_via_mitmproxy:
     runs-on: ubuntu-22.04
-
-    env:
-      # Your real registry host (upstream)
-      UPSTREAM_REGISTRY: productdemo.jfrog.io
-
-      # Local proxy endpoint Docker will push to
-      PROXY_HOST: 127.0.0.1
-      PROXY_PORT: "5000"
-
-      # Target repo (keep as you want)
-      TARGET_REPO: docker-local/myimg
-      TARGET_TAG: v1.2.3-linux-amd64
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Use older docker client/daemon as requested
+      # We intentionally use older Docker
       - name: Install pinned Docker (20.10.24)
         uses: docker/setup-docker-action@v4
         with:
           version: v20.10.24
 
-      - name: Show Docker versions
-        run: |
-          docker version
-          docker info
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install nginx
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y nginx
-          nginx -v
-
-      - name: Configure nginx reverse proxy (preserve Host + Authorization, rewrite Location)
+      - name: Install mitmproxy (pip, venv)
         run: |
           set -euo pipefail
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install "mitmproxy==11.0.2"
+          mitmdump --version
 
-          # Create a dedicated log dir we can upload
-          sudo mkdir -p /var/log/nginx
+      - name: Create mitmproxy addon (log request/response headers)
+        run: |
+          cat > "$GITHUB_WORKSPACE/dump_headers.py" <<'PY'
+          from datetime import datetime
 
-          # Replace default site
-          sudo rm -f /etc/nginx/sites-enabled/default || true
+          REDACT = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
-          cat <<'NGINX' | sudo tee /etc/nginx/sites-available/registry-proxy.conf
-          log_format docker '$remote_addr - $remote_user [$time_local] '
-                            '"$request" $status $body_bytes_sent '
-                            'rt=$request_time uct=$upstream_connect_time '
-                            'uht=$upstream_header_time urt=$upstream_response_time '
-                            'host="$host" upstream="$upstream_addr" '
-                            'req_auth="$http_authorization" '
-                            'req_ua="$http_user_agent" '
-                            'req_te="$http_transfer_encoding" '
-                            'req_cl="$http_content_length" '
-                            'resp_www_auth="$sent_http_www_authenticate" '
-                            'resp_loc="$sent_http_location" '
-                            'resp_range="$sent_http_range" '
-                            'resp_duuid="$sent_http_docker_upload_uuid" '
-                            'resp_dcd="$sent_http_docker_content_digest"';
+          def _ts():
+              return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-          server {
-            listen 5000;
-            server_name 127.0.0.1 localhost;
+          def request(flow):
+              r = flow.request
+              print(f"[{_ts()}] >>> {r.method} {r.scheme}://{r.host}{r.path}")
+              for k, v in r.headers.items():
+                  if k.lower() in REDACT:
+                      v = "<redacted>"
+                  print(f"  {k}: {v}")
+              print("")
 
-            # Docker layers can be big; do not cap body
-            client_max_body_size 0;
-            chunked_transfer_encoding on;
+          def response(flow):
+              r = flow.request
+              resp = flow.response
+              print(f"[{_ts()}] <<< {resp.status_code} for {r.method} {r.path}")
+              # Print a few useful headers (add more if you want)
+              for k in (
+                  "Content-Type",
+                  "Content-Length",
+                  "Docker-Upload-UUID",
+                  "Docker-Content-Digest",
+                  "Location",
+                  "Range",
+                  "WWW-Authenticate",
+              ):
+                  if k in resp.headers:
+                      print(f"  {k}: {resp.headers.get(k)}")
+              print("")
+          PY
 
-            access_log /var/log/nginx/docker_access.log docker;
-            error_log  /var/log/nginx/docker_error.log info;
-
-            # We want to see headers + avoid buffering issues
-            proxy_request_buffering off;
-            proxy_buffering off;
-
-            location / {
-              # Upstream is ALWAYS https
-              proxy_pass https://productdemo.jfrog.io;
-
-              # CRITICAL: keep upstream host so Bearer token audience matches
-              proxy_set_header Host productdemo.jfrog.io;
-
-              # CRITICAL: forward Authorization header (Bearer ... from docker)
-              proxy_set_header Authorization $http_authorization;
-
-              # Keep sane proxy headers
-              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-              proxy_set_header X-Forwarded-Proto $scheme;
-
-              proxy_http_version 1.1;
-              proxy_set_header Connection "";
-
-              # Long timeouts for big pushes
-              proxy_read_timeout 3600;
-              proxy_send_timeout 3600;
-
-              # IMPORTANT: rewrite Location so Docker continues to talk to localhost proxy
-              # (otherwise uploads jump to productdemo directly and you stop seeing traffic)
-              proxy_redirect https://productdemo.jfrog.io/ http://127.0.0.1:5000/;
-            }
-          }
-          NGINX
-
-          sudo ln -sf /etc/nginx/sites-available/registry-proxy.conf /etc/nginx/sites-enabled/registry-proxy.conf
-
-          sudo nginx -t
-          sudo systemctl restart nginx
-          sudo systemctl status nginx --no-pager || true
-
-          echo "Listening sockets:"
-          sudo ss -ltnp | grep ':5000' || true
-
-      - name: Sanity check proxy -> upstream (shows headers via nginx logs)
+      # Start mitmproxy as a *reverse proxy* that listens on 127.0.0.1:5000
+      # and forwards to https://productdemo.jfrog.io
+      - name: Start mitmproxy reverse proxy (127.0.0.1:5000 -> productdemo.jfrog.io:443)
         run: |
           set -euo pipefail
-          # This should produce a 401 from upstream /v2/ and log in nginx
-          curl -v http://127.0.0.1:5000/v2/ || true
-          echo "=== nginx access log (tail) ==="
-          sudo tail -n 50 /var/log/nginx/docker_access.log || true
-          echo "=== nginx error log (tail) ==="
-          sudo tail -n 50 /var/log/nginx/docker_error.log || true
+          . .venv/bin/activate
 
-      - name: Docker login to upstream registry (token may bypass proxy - OK)
+          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
+          mkdir -p "$MITM_CONF"
+
+          # IMPORTANT:
+          # - reverse:https://productdemo.jfrog.io makes mitmproxy terminate TLS upstream to Artifactory.
+          # - Docker talks to http://127.0.0.1:5000 (plain HTTP), so we avoid TLS issues on the client side.
+          # - We do NOT want Docker to bypass proxy, so NO_PROXY must NOT include 127.0.0.1 here for the daemon env.
+          nohup mitmdump \
+            --set confdir="$MITM_CONF" \
+            --mode "reverse:https://productdemo.jfrog.io" \
+            --listen-host 127.0.0.1 \
+            --listen-port 5000 \
+            --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
+            -s "$GITHUB_WORKSPACE/dump_headers.py" \
+            > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
+
+          sleep 2
+          ps aux | grep -E "mitm(dump|proxy)" | grep -v grep || true
+          echo "=== mitmproxy.log (head) ==="
+          head -n 50 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+
+      # Make sure *dockerd* is NOT using a different proxy that could bypass your local reverse proxy.
+      # (We keep it simple: no proxy env for daemon at all.)
+      - name: Ensure Docker daemon has no proxy env (avoid bypass)
         run: |
           set -euo pipefail
-          docker login "${{ env.UPSTREAM_REGISTRY }}" \
-            -u "${{ secrets.JFROG_USERNAME }}" \
-            --password "${{ secrets.JFROG_PASSWORD }}"
+          sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
 
-      - name: Pull alpine (avoid docker load differences)
+          echo "=== systemd docker env (should NOT include HTTP_PROXY/HTTPS_PROXY) ==="
+          sudo systemctl show docker --property=Environment --no-pager || true
+
+      - name: Pull alpine from Docker Hub
         run: |
           set -euo pipefail
           docker pull alpine:latest
-          docker images | head -n 20
+          docker images | head
 
-      - name: Tag image to LOCAL proxy repository
+      # IMPORTANT:
+      # Push target is 127.0.0.1:5000 -> mitmproxy -> productdemo.jfrog.io
+      - name: Tag alpine for push target
         run: |
           set -euo pipefail
-          PROXY_REF="${{ env.PROXY_HOST }}:${{ env.PROXY_PORT }}/${{ env.TARGET_REPO }}:${{ env.TARGET_TAG }}"
-          docker tag alpine:latest "$PROXY_REF"
-          echo "Tagged: $PROXY_REF"
+          docker tag alpine:latest 127.0.0.1:5000/docker-local/myimg:alpine
 
-      - name: Push via LOCAL proxy (captures registry headers in nginx logs)
+      # KEY FIX:
+      # Docker decides which creds to use by the *registry host* in the image name.
+      # Since we push to 127.0.0.1:5000, we MUST login to 127.0.0.1:5000 as well.
+      - name: Docker login (productdemo.jfrog.io)
         run: |
           set -euo pipefail
-          PROXY_REF="${{ env.PROXY_HOST }}:${{ env.PROXY_PORT }}/${{ env.TARGET_REPO }}:${{ env.TARGET_TAG }}"
-          docker --debug push "$PROXY_REF" || {
-            echo "=== nginx access log (tail) ==="
-            sudo tail -n 200 /var/log/nginx/docker_access.log || true
-            echo "=== nginx error log (tail) ==="
-            sudo tail -n 200 /var/log/nginx/docker_error.log || true
-            exit 1
-          }
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login productdemo.jfrog.io \
+            -u "${{ secrets.JFROG_USERNAME }}" \
+            --password-stdin
 
-      - name: Collect debug artifacts
+      - name: Docker login (proxy registry 127.0.0.1:5000)  # required!
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login 127.0.0.1:5000 \
+            -u "${{ secrets.JFROG_USERNAME }}" \
+            --password-stdin
+
+      - name: Push via mitmproxy (docker --debug)
+        env:
+          DOCKER_CLI_HINTS: "false"
+        run: |
+          set -euo pipefail
+          docker --debug push 127.0.0.1:5000/docker-local/myimg:alpine
+
+      - name: Collect logs
         if: always()
         run: |
-          set -euo pipefail
+          set +e
           sudo journalctl -u docker --no-pager > dockerd.log || true
-          sudo cp /var/log/nginx/docker_access.log nginx_access.log || true
-          sudo cp /var/log/nginx/docker_error.log nginx_error.log || true
-          sudo nginx -T > nginx_full_dump.txt || true
-
-          echo "=== docker push output is in step logs; tails below ==="
-          echo "=== nginx access log (tail) ==="
-          tail -n 120 nginx_access.log || true
-          echo "=== nginx error log (tail) ==="
-          tail -n 120 nginx_error.log || true
+          echo "==== mitmproxy.log (tail) ===="
+          tail -n 400 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+          echo "==== docker daemon log (tail) ===="
+          tail -n 300 "$GITHUB_WORKSPACE/dockerd.log" || true
+          echo "==== files ===="
+          ls -lah "$GITHUB_WORKSPACE" || true
 
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: proxy-debug-logs
+          name: debug-logs
           path: |
+            mitmproxy.flows
+            mitmproxy.log
             dockerd.log
-            nginx_access.log
-            nginx_error.log
-            nginx_full_dump.txt
+            dump_headers.py
+            mitm-conf
