@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: "20.10.24"
-        options: ["20.10.24", "24.0.9", "27.4.0", "28.0.4"]
+        options: ["20.10.24", "24.0.9", "27.4.0", "28.0.4", "29.1.3"]
       source_image:
         description: "Image to pull"
         type: string
