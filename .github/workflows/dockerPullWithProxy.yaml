@@ -1,4 +1,4 @@
-name: Pull Image Only (reverse mitmproxy + Location/realm/scope/service rewrite)
+name: Pull Image Only (reverse mitmproxy + TLS on proxy + Location/realm/scope/service rewrite)
 
 on:
   push:
@@ -102,7 +102,9 @@ jobs:
           UPSTREAM_HOST = os.environ.get("MITM_UPSTREAM_HOST", "productdemo.jfrog.io")
 
           PROXY_REGISTRY = f"{PROXY_HOST}:{PROXY_PORT}"      # 127.0.0.1:5000
-          PROXY_ORIGIN   = f"http://{PROXY_REGISTRY}"         # http://127.0.0.1:5000
+          # IMPORTANT: Docker will talk HTTPS to the proxy registry.
+          # We still rewrite realm to a PROXY_ORIGIN that matches the token endpoint scheme/host we want Docker to call.
+          PROXY_ORIGIN   = f"https://{PROXY_REGISTRY}"
           UPSTREAM_HTTPS = f"https://{UPSTREAM_HOST}"
           UPSTREAM_HTTP  = f"http://{UPSTREAM_HOST}"
 
@@ -122,6 +124,7 @@ jobs:
               print("")
 
           def _rewrite_abs_url(v: str) -> str:
+              # rewrite absolute upstream URLs back to proxy origin
               if v.startswith(UPSTREAM_HTTPS):
                   return PROXY_ORIGIN + v[len(UPSTREAM_HTTPS):]
               if v.startswith(UPSTREAM_HTTP):
@@ -130,26 +133,34 @@ jobs:
 
           def _rewrite_www_authenticate(flow, header_val: str) -> str:
               new = header_val
+
+              # 1) realm -> proxy (HTTPS)
               new = new.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
               new = new.replace(f'realm="{UPSTREAM_HTTP}',  f'realm="{PROXY_ORIGIN}')
+
+              # 2) service -> proxy registry (host:port)
               new = re.sub(r'service="[^"]+"', f'service="{PROXY_REGISTRY}"', new)
 
-              # scope repository:<image>:... -> repository:<repo>/<image>:...
-              m = re.match(r"^/v2/([^/]+)/([^/]+)/", flow.request.path)
+              # 3) scope repository:<image>:... -> repository:<repo>/<image>:...
+              m = re.match(r"^/v2/([^/]+)/(.+)/", flow.request.path)
               if m:
                   repo = m.group(1)
-                  image = m.group(2)
+                  image = m.group(2).split("/")[0] if "/" in m.group(2) else m.group(2)
+                  # Better: scope should include the full image path after repo.
+                  image_path = m.group(2).rstrip("/")
                   new = re.sub(
-                      rf'scope="repository:{re.escape(image)}:',
-                      f'scope="repository:{repo}/{image}:',
+                      r'scope="repository:([^":]+):',
+                      f'scope="repository:{repo}/{image_path}:',
                       new
                   )
+
               return new
 
           def response(flow):
               r = flow.request
               resp = flow.response
 
+              # Keep Location rewrite logic (harmless for pulls; useful if upstream returns absolute URLs)
               if "Location" in resp.headers:
                   old = resp.headers["Location"]
                   new = old
@@ -175,38 +186,15 @@ jobs:
                   if new != old:
                       resp.headers["WWW-Authenticate"] = new
                       print(f"[{_ts()}] !!! Rewrote WWW-Authenticate (realm/service/scope)")
+                      print(f"  WWW-Authenticate: {new}")
                       print("")
 
               print(f"[{_ts()}] <<< {resp.status_code} for {r.method} {r.path}")
-              for k in ("Content-Type","Content-Length","Docker-Upload-UUID","Docker-Content-Digest","Location","Range","WWW-Authenticate"):
+              for k in ("Content-Type","Content-Length","Docker-Content-Digest","Location","Range","WWW-Authenticate"):
                   if k in resp.headers:
                       print(f"  {k}: {resp.headers.get(k)}")
               print("")
           PY
-
-      - name: Start mitmproxy reverse proxy
-        run: |
-          set -euo pipefail
-          . .venv/bin/activate
-
-          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
-          mkdir -p "$MITM_CONF"
-
-          export MITM_PROXY_HOST="${{ inputs.proxy_listen_host }}"
-          export MITM_PROXY_PORT="${{ inputs.proxy_listen_port }}"
-          export MITM_UPSTREAM_HOST="${{ steps.vars.outputs.upstream_host }}"
-
-          nohup mitmdump \
-            --set confdir="$MITM_CONF" \
-            --mode "reverse:https://${MITM_UPSTREAM_HOST}" \
-            --listen-host "${MITM_PROXY_HOST}" \
-            --listen-port "${MITM_PROXY_PORT}" \
-            --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
-            -s "$GITHUB_WORKSPACE/mitm_rewrite.py" \
-            > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
-
-          sleep 2
-          head -n 80 "$GITHUB_WORKSPACE/mitmproxy.log" || true
 
       - name: Ensure Docker daemon has no proxy env
         run: |
@@ -217,10 +205,96 @@ jobs:
           sudo systemctl restart docker
           sudo systemctl show docker --property=Environment --no-pager || true
 
+      - name: Create local CA + server cert for proxy and trust it in Docker
+        run: |
+          set -euo pipefail
+          PROXY_REG="${{ steps.vars.outputs.proxy_registry }}"    # 127.0.0.1:5000
+          PROXY_HOST="${{ inputs.proxy_listen_host }}"            # 127.0.0.1
+          CERT_DIR="$GITHUB_WORKSPACE/tls"
+          mkdir -p "$CERT_DIR"
+
+          # Create CA
+          openssl genrsa -out "$CERT_DIR/ca.key" 2048
+          openssl req -x509 -new -nodes -key "$CERT_DIR/ca.key" \
+            -sha256 -days 2 \
+            -subj "/CN=mitmproxy-local-CA" \
+            -out "$CERT_DIR/ca.crt"
+
+          # Create server key + CSR with SAN for IP/DNS
+          openssl genrsa -out "$CERT_DIR/server.key" 2048
+
+          cat > "$CERT_DIR/openssl.cnf" <<EOF
+          [req]
+          default_bits = 2048
+          prompt = no
+          default_md = sha256
+          distinguished_name = dn
+          req_extensions = req_ext
+
+          [dn]
+          CN = ${PROXY_HOST}
+
+          [req_ext]
+          subjectAltName = @alt_names
+
+          [alt_names]
+          IP.1 = 127.0.0.1
+          DNS.1 = localhost
+          EOF
+
+          openssl req -new -key "$CERT_DIR/server.key" \
+            -out "$CERT_DIR/server.csr" \
+            -config "$CERT_DIR/openssl.cnf"
+
+          openssl x509 -req -in "$CERT_DIR/server.csr" \
+            -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
+            -out "$CERT_DIR/server.crt" -days 2 -sha256 \
+            -extensions req_ext -extfile "$CERT_DIR/openssl.cnf"
+
+          # Docker trust for this registry host:port
+          sudo mkdir -p "/etc/docker/certs.d/${PROXY_REG}"
+          sudo cp "$CERT_DIR/ca.crt" "/etc/docker/certs.d/${PROXY_REG}/ca.crt"
+
+          # Restart docker so it picks up certs
+          sudo systemctl restart docker
+          docker info >/dev/null
+
+      - name: Start mitmproxy reverse proxy (TLS on listener)
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+
+          export MITM_CONF="$GITHUB_WORKSPACE/mitm-conf"
+          mkdir -p "$MITM_CONF"
+
+          export MITM_PROXY_HOST="${{ inputs.proxy_listen_host }}"
+          export MITM_PROXY_PORT="${{ inputs.proxy_listen_port }}"
+          export MITM_UPSTREAM_HOST="${{ steps.vars.outputs.upstream_host }}"
+          CERT_DIR="$GITHUB_WORKSPACE/tls"
+
+          nohup mitmdump \
+            --set confdir="$MITM_CONF" \
+            --mode "reverse:https://${MITM_UPSTREAM_HOST}" \
+            --listen-host "${MITM_PROXY_HOST}" \
+            --listen-port "${MITM_PROXY_PORT}" \
+            --certs "${MITM_PROXY_HOST}=${CERT_DIR}/server.crt,${CERT_DIR}/server.key" \
+            --save-stream-file "$GITHUB_WORKSPACE/mitmproxy.flows" \
+            -s "$GITHUB_WORKSPACE/mitm_rewrite.py" \
+            > "$GITHUB_WORKSPACE/mitmproxy.log" 2>&1 &
+
+          sleep 2
+          head -n 120 "$GITHUB_WORKSPACE/mitmproxy.log" || true
+
       - name: Docker login (upstream)
         run: |
           set -euo pipefail
           echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.upstream_host }}" \
+            -u "${{ secrets.JFROG_USERNAME }}" --password-stdin
+
+      - name: Docker login (proxy registry)
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.JFROG_PASSWORD }}" | docker login "${{ steps.vars.outputs.proxy_registry }}" \
             -u "${{ secrets.JFROG_USERNAME }}" --password-stdin
 
       - name: Pull via mitmproxy (docker --debug)
@@ -250,3 +324,5 @@ jobs:
             docker_cli_debug.log
             mitm_rewrite.py
             mitm-conf
+            tls/ca.crt
+            tls/server.crt
