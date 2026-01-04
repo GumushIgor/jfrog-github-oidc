@@ -100,7 +100,7 @@ jobs:
           UPSTREAM_HOST = os.environ.get("MITM_UPSTREAM_HOST", "productdemo.jfrog.io")
 
           PROXY_REGISTRY = f"{PROXY_HOST}:{PROXY_PORT}"
-          # If proxy is TLS, rewrite realm to https://proxy
+          # Proxy is TLS, rewrite realm to https://proxy
           PROXY_ORIGIN   = f"https://{PROXY_REGISTRY}"
 
           UPSTREAM_HTTPS = f"https://{UPSTREAM_HOST}"
@@ -131,21 +131,21 @@ jobs:
           def _rewrite_www_authenticate(flow, header_val: str) -> str:
               new = header_val
 
-              # realm -> proxy
+              # 1) realm -> proxy
               new = new.replace(f'realm="{UPSTREAM_HTTPS}', f'realm="{PROXY_ORIGIN}')
               new = new.replace(f'realm="{UPSTREAM_HTTP}',  f'realm="{PROXY_ORIGIN}')
 
-              # service -> proxy host:port
+              # 2) service -> proxy host:port
               new = re.sub(r'service="[^"]+"', f'service="{PROXY_REGISTRY}"', new)
 
-              # scope repository:<image>:... -> repository:<repo>/<image>:...
-              # For pull: /v2/<repo>/<image...>/manifests/<tag>
+              # 3) scope repository:<something>:pull -> repository:<repo>/<full-image-path>:pull
+              # For pull requests: /v2/<repo>/<image...>/manifests/<tag_or_digest>
               m = re.match(r"^/v2/([^/]+)/(.+?)/", flow.request.path)
               if m:
                   repo = m.group(1)
-                  image_path = m.group(2)
+                  image_path = m.group(2)  # keep full path including slashes
                   new = re.sub(
-                      r'scope="repository:([^":]+):',
+                      r'scope="repository:[^:"]+:',
                       f'scope="repository:{repo}/{image_path}:',
                       new
                   )
@@ -199,7 +199,7 @@ jobs:
           sudo systemctl restart docker
           sudo systemctl show docker --property=Environment --no-pager || true
 
-      - name: Create local CA + server cert for proxy and trust it in Docker
+      - name: Create local CA + server cert for proxy and trust it (Docker + containerd + system)
         run: |
           set -euo pipefail
           PROXY_REG="${{ steps.vars.outputs.proxy_registry }}"   # 127.0.0.1:5000
@@ -247,15 +247,34 @@ jobs:
           # mitmproxy expects ONE pem containing key+cert
           cat "$CERT_DIR/server.key" "$CERT_DIR/server.crt" > "$CERT_DIR/server.pem"
 
-          # Trust CA for that registry in Docker
+          # 1) Docker trust for registry host:port
           sudo mkdir -p "/etc/docker/certs.d/${PROXY_REG}"
           sudo cp "$CERT_DIR/ca.crt" "/etc/docker/certs.d/${PROXY_REG}/ca.crt"
+
+          # 2) containerd trust (needed for newer Docker versions using containerd image store)
+          sudo mkdir -p "/etc/containerd/certs.d/${PROXY_REG}"
+          sudo cp "$CERT_DIR/ca.crt" "/etc/containerd/certs.d/${PROXY_REG}/ca.crt"
+          sudo tee "/etc/containerd/certs.d/${PROXY_REG}/hosts.toml" >/dev/null <<EOF
+          server = "https://${PROXY_REG}"
+
+          [host."https://${PROXY_REG}"]
+            capabilities = ["pull", "resolve"]
+            ca = "/etc/containerd/certs.d/${PROXY_REG}/ca.crt"
+          EOF
+
+          # 3) System trust (helps any subprocess that does TLS validation)
+          sudo cp "$CERT_DIR/ca.crt" "/usr/local/share/ca-certificates/mitmproxy-local-CA.crt"
+          sudo update-ca-certificates
 
           sudo systemctl restart docker
           docker info >/dev/null
 
           echo "TLS artifacts:"
           ls -la "$CERT_DIR"
+          echo "Docker certs:"
+          sudo ls -la "/etc/docker/certs.d/${PROXY_REG}" || true
+          echo "containerd certs:"
+          sudo ls -la "/etc/containerd/certs.d/${PROXY_REG}" || true
 
       - name: Start mitmproxy reverse proxy (TLS listener)
         run: |
